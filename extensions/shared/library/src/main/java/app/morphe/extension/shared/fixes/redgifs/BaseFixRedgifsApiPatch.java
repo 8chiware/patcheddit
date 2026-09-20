@@ -31,11 +31,24 @@ public abstract class BaseFixRedgifsApiPatch extends PatchedditInterceptor {
     public Response doIntercept(@NonNull Chain chain) throws IOException {
         Request request = chain.request();
         if (!request.url().host().equals("api.redgifs.com")) {
-            return chain.proceed(request);
+            Response response = chain.proceed(request);
+            // Reddit API traffic shares this client. Every Redgifs post it returns carries a
+            // Reddit-hosted copy of the media in its preview object; remember those so the
+            // Redgifs request below can be answered without contacting Redgifs at all.
+            RedditCdnPreviewCache.captureRedditResponse(request, response);
+            return response;
         }
 
         final String path = request.url().encodedPath();
         Logger.printInfo(() -> "Redgifs: intercepted " + request.method() + " " + path);
+
+        // Reddit's own copy of this gif, if the post it came from has been seen. Answering
+        // here short-circuits the whole Redgifs flow: no temporary token, no request to
+        // Redgifs, and nothing for their verification gate to apply to.
+        String redditCdnResponseBody = RedditCdnPreviewCache.buildGifResponseBody(path);
+        if (redditCdnResponseBody != null) {
+            return buildLocalJsonResponse(request, redditCdnResponseBody);
+        }
 
         String userAgent = getDefaultUserAgent();
         boolean forceTokenRefresh = false;
@@ -85,6 +98,19 @@ public abstract class BaseFixRedgifsApiPatch extends PatchedditInterceptor {
             } catch (IOException ex) {
                 Logger.printException(() -> "Redgifs: failed to obtain temporary token for user agent \""
                         + finalUserAgent + "\"", ex);
+
+                // The client asks for an OAuth token before it asks for the gif, so a token
+                // failure ends playback before reaching the gif request that Reddit's CDN copy
+                // could have answered. Hand back a placeholder token and let the flow continue:
+                // a gif with no cached Reddit copy still fails, just one request later.
+                if (path.equals("/v2/oauth/client") && RedditCdnPreviewCache.isPatchIncluded()) {
+                    Logger.printInfo(() -> "Redgifs: emulating /v2/oauth/client with a placeholder"
+                            + " token so the Reddit CDN copy can still be used");
+                    String placeholderBody = RedgifsTokenManager.getEmulatedOAuthResponseBody(
+                            new RedgifsTokenManager.RedgifsToken("", System.currentTimeMillis() / 1000));
+                    return buildLocalJsonResponse(request, placeholderBody);
+                }
+
                 throw ex;
             }
 
