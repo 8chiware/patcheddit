@@ -1,0 +1,140 @@
+name: Build patch bundle
+
+# Builds the .mpp patch bundle, publishes it as a GitHub release, and repoints
+# patches-bundle.json at it so Morphe Manager picks the build up as an update.
+# Unlike release.yml this needs no GPG secrets and does not run semantic-release,
+# so it works on a fork as-is.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  # Required to publish the release and to push the manifest commit.
+  contents: write
+
+concurrency:
+  group: build-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        # Credentials are deliberately kept: the manifest step below pushes to main.
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        # First-party: provides the dependency cache and, via validate-wrappers
+        # (on by default), fails the build if gradle-wrapper.jar does not match a
+        # published Gradle checksum.
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Build
+        env:
+          # The app.morphe.patches settings plugin resolves from GitHub Packages
+          # (maven.pkg.github.com/MorpheApp/registry), which requires a token even
+          # for public packages. Without this the build fails at plugin resolution.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew :patches:buildAndroid
+
+      - name: Locate bundle
+        id: bundle
+        run: |
+          set -euo pipefail
+          built=$(ls patches/build/libs/patches-*.mpp | head -n1)
+          base=$(sed -n 's/^version *= *//p' gradle.properties | tr -d '[:space:]')
+
+          # Append the run number so every build outranks the last under semver
+          # precedence (same leading identifiers, one more of them), which is what
+          # Morphe Manager compares to decide an update is available.
+          version="${base}.${GITHUB_RUN_NUMBER}"
+          asset="patches-${version}.mpp"
+          cp "$built" "$asset"
+
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Built $asset ($(du -h "$asset" | cut -f1))"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: patch-bundle
+          path: ${{ steps.bundle.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Publish release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: bundle-${{ github.run_number }}
+          ASSET: ${{ steps.bundle.outputs.asset }}
+          VERSION: ${{ steps.bundle.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}"
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Patch bundle $VERSION" \
+            --notes "Built from \`${GITHUB_SHA}\`. Add this repo as a source in Morphe Manager, or pass the bundle to morphe-cli with \`--patches=${ASSET}\`." \
+            "$ASSET"
+
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Point manifest at the release
+        # Only on main: Manager reads patches-bundle.json from the default branch.
+        if: github.ref == 'refs/heads/main'
+        env:
+          URL: ${{ steps.release.outputs.url }}
+          VERSION: ${{ steps.bundle.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Only version, download_url and created_at change. The description is the
+          # fork's own summary of what the bundle contains and Manager surfaces it,
+          # so it is preserved rather than overwritten.
+          jq --arg version "$VERSION" \
+             --arg url "$URL" \
+             --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+             '.version = $version | .download_url = $url | .created_at = $created_at' \
+             patches-bundle.json > patches-bundle.json.tmp
+          mv patches-bundle.json.tmp patches-bundle.json
+
+          if git diff --quiet -- patches-bundle.json; then
+            echo "Manifest already current; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add patches-bundle.json
+          # [skip ci] is what stops this push from re-triggering this workflow.
+          git commit -m "chore: point manifest at build ${GITHUB_RUN_NUMBER} [skip ci]"
+
+          # Another run may have pushed while this one was building.
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Summary
+        env:
+          URL: ${{ steps.release.outputs.url }}
+          VERSION: ${{ steps.bundle.outputs.version }}
+        run: |
+          {
+            echo "### Patch bundle $VERSION published"
+            echo
+            echo "- Bundle: $URL"
+            echo "- Source for Morphe Manager: https://morphe.software/add-source?github=${GITHUB_REPOSITORY}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,22 +6,41 @@ on:
       - dev
   workflow_dispatch:
 
-env:
-  MESSAGE: Merge branch `${{ github.head_ref || github.ref_name }}` to `main`
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   pull-request:
     name: Open pull request
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
       - name: Open pull request
-        uses: repo-sync/pull-request@v2
-        with:
-          destination_branch: main
-          pr_title: 'chore: ${{ env.MESSAGE }}'
-          pr_body: |
-            This pull request will ${{ env.MESSAGE }}.
-          pr_draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Kept out of the script body rather than interpolated into it.
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          open=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$HEAD_BRANCH" \
+            --state open \
+            --json number \
+            --jq 'length')
+
+          if [ "$open" -gt 0 ]; then
+            echo "A pull request from $HEAD_BRANCH to main is already open."
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$HEAD_BRANCH" \
+            --draft \
+            --title "chore: Merge branch \`${HEAD_BRANCH}\` to \`main\`" \
+            --body "This pull request will merge branch \`${HEAD_BRANCH}\` to \`main\`."
