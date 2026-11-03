@@ -59,7 +59,7 @@ fun spoofClientPatch(
     )
     val userAgentOption = stringOption(
         "user-agent",
-        "org.quantumbadger.redreader/1.25.1",
+        "org.quantumbadger.redreader/1.27",
         null,
         "User agent",
         "The app's user agent. Refer to Patcheddit documentation for more information " +
