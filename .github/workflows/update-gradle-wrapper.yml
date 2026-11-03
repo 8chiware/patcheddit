@@ -20,8 +20,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # The update action sets its own auth header. Persisting checkout's as well
+          # makes GitHub reject git fetch and push with 400 "Duplicate header".
+          persist-credentials: false
 
       - name: Update Gradle Wrapper
         uses: gradle-update/update-gradle-wrapper-action@512b1875f3b6270828abfe77b247d5895a2da1e5 # v2
-        with:
-          target-branch: dev
+        env:
+          # gradlew loads settings.gradle.kts, whose app.morphe.patches plugin resolves
+          # from GitHub Packages, which requires a token even for public packages.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
