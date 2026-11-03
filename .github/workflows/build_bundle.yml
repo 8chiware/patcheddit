@@ -41,31 +41,39 @@ jobs:
         # published Gradle checksum.
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^version *= *//p' gradle.properties | tr -d '[:space:]')
+
+          # Append the run number so every build outranks the last under semver
+          # precedence (same leading identifiers, one more of them), which is what
+          # Morphe Manager compares to decide an update is available.
+          echo "version=${base}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
       - name: Build
         env:
           # The app.morphe.patches settings plugin resolves from GitHub Packages
           # (maven.pkg.github.com/MorpheApp/registry), which requires a token even
           # for public packages. Without this the build fails at plugin resolution.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew :patches:buildAndroid
+        # -Pversion overrides gradle.properties, so the version inside the bundle's
+        # META-INF/MANIFEST.MF matches the one in patches-bundle.json. Without this
+        # the manifest advertises a build the bundle itself does not claim to be,
+        # and Manager displays the stale number.
+        run: ./gradlew :patches:buildAndroid -Pversion=${{ steps.version.outputs.version }}
 
       - name: Locate bundle
         id: bundle
         run: |
           set -euo pipefail
-          built=$(ls patches/build/libs/patches-*.mpp | head -n1)
-          base=$(sed -n 's/^version *= *//p' gradle.properties | tr -d '[:space:]')
-
-          # Append the run number so every build outranks the last under semver
-          # precedence (same leading identifiers, one more of them), which is what
-          # Morphe Manager compares to decide an update is available.
-          version="${base}.${GITHUB_RUN_NUMBER}"
-          asset="patches-${version}.mpp"
-          cp "$built" "$asset"
-
+          asset=$(ls patches/build/libs/patches-*.mpp | head -n1)
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$asset")" >> "$GITHUB_OUTPUT"
+
           echo "Built $asset ($(du -h "$asset" | cut -f1))"
+          echo "Bundle manifest version: $(unzip -p "$asset" META-INF/MANIFEST.MF | sed -n 's/^Version: //p')"
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -80,15 +88,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: bundle-${{ github.run_number }}
           ASSET: ${{ steps.bundle.outputs.asset }}
-          VERSION: ${{ steps.bundle.outputs.version }}
+          ASSET_NAME: ${{ steps.bundle.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET_NAME}"
 
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Patch bundle $VERSION" \
-            --notes "Built from \`${GITHUB_SHA}\`. Add this repo as a source in Morphe Manager, or pass the bundle to morphe-cli with \`--patches=${ASSET}\`." \
+            --notes "Built from \`${GITHUB_SHA}\`. Add this repo as a source in Morphe Manager, or pass the bundle to morphe-cli with \`--patches=${ASSET_NAME}\`." \
             "$ASSET"
 
           echo "url=$url" >> "$GITHUB_OUTPUT"
@@ -98,9 +107,12 @@ jobs:
         if: github.ref == 'refs/heads/main'
         env:
           URL: ${{ steps.release.outputs.url }}
-          VERSION: ${{ steps.bundle.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+
+          # set -u lets an empty value through, and jq would write it to the manifest.
+          : "${VERSION:?}"
 
           # Only version, download_url and created_at change. The description is the
           # fork's own summary of what the bundle contains and Manager surfaces it,
@@ -130,7 +142,7 @@ jobs:
       - name: Summary
         env:
           URL: ${{ steps.release.outputs.url }}
-          VERSION: ${{ steps.bundle.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           {
             echo "### Patch bundle $VERSION published"
